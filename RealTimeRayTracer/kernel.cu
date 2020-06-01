@@ -1,9 +1,9 @@
-
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
-
 #include <stdio.h>
 #include <iostream>
+#include <float.h>
+#include <time.h>
+#include <chrono>
+#include <ctime>
 
 // OpenGL
 #include <gl/glew.h>
@@ -11,166 +11,496 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 
-int main() {
+// CUDA
+#include "cuda_runtime.h"
+#include <cuda_gl_interop.h>
+#include "device_launch_parameters.h"
+#include <curand_kernel.h>
+
+// CUDA Helper
+#include "libs/helper_cuda.h"
+#include "libs/helper_cuda_gl.h"
+
+#include "shader_tools/GLSLProgram.h"
+#include "shader_tools/GLSLShader.h"
+
+// My Objects
+#include "vec3.h"
+#include "ray.h"
+#include "sphere.h"
+#include "camera.h"
+#include "hitable_list.h"
+#include "material.h"
+
+#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__)
+
+GLFWwindow* window;
+int WIDTH = 640;
+int HEIGHT = 480;
+int num_texels = WIDTH * HEIGHT;
+int num_values = num_texels * 4;
+int size_tex_data = sizeof(GLuint) * num_values;
+
+// OpenGL
+GLuint VBO, VAO, EBO;
+GLSLShader drawtex_f;
+GLSLShader drawtex_v;
+GLSLProgram shdrawtex;
+
+// CUDA buffers
+void* cuda_dev_render_buffer;	// Stores initial
+void* cuda_dev_render_buffer_2;	// Stores final output
+void* cuda_ping_buffer;	// Stores intermediate effects
+
+
+struct inputPointers {
+	unsigned int* image1; // texture position
+};
+
+
+struct cudaGraphicsResource* cuda_tex_resource;
+GLuint opengl_tex_cuda;	// OpenGL Texture for cuda result
+
+static const char* glsl_drawtex_vertshader_src =
+"#version 330 core\n"
+"layout (location = 0) in vec3 position;\n"
+"layout (location = 1) in vec2 texCoord;\n"
+"\n"
+"out vec2 ourTexCoord;\n"
+"\n"
+"void main()\n"
+"{\n"
+"	gl_Position = vec4(position, 1.0f);\n"
+"	ourTexCoord = texCoord;\n"
+"}\n";
+
+static const char* glsl_drawtex_fragshader_src =
+"#version 330 core\n"
+"uniform usampler2D tex;\n"
+"in vec2 ourTexCoord;\n"
+"out vec4 color;\n"
+"void main()\n"
+"{\n"
+"   	vec4 c = texture(tex, ourTexCoord);\n"
+"   	color = c / 255.0;\n"
+"}\n";
+
+// QUAD GEOMETRY
+GLfloat vertices[] = {
+	// Positions             // Texture Coords
+	1.0f, 1.0f, 0.5f,1.0f, 1.0f,  // Top Right
+	1.0f, -1.0f, 0.5f, 1.0f, 0.0f,  // Bottom Right
+	-1.0f, -1.0f, 0.5f, 0.0f, 0.0f,  // Bottom Left
+	-1.0f, 1.0f, 0.5f,  0.0f, 1.0f // Top Left 
+};
+// you can also put positions, colors and coordinates in seperate VBO's
+GLuint indices[] = {
+	0, 1, 3,
+	1, 2, 3
+};
+
+
+void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
+	if (result) {
+		std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << "at " <<
+			file << ":" << line << "'" << func << "/n";
+		cudaDeviceReset();
+		exit(99);
+	}
+}
+
+
+__device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_state) {
+	ray cur_ray = r;
+	vec3 cur_attenuation = vec3(1.0, 1.0, 1.0);
+	for (int i = 0; i < 4; i++) {
+		hit_record rec;
+		if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
+			ray scattered;
+			vec3 attenuation;
+			if (rec.mat_ptr->scatter(cur_ray, rec, attenuation, scattered, local_rand_state)) {
+				cur_attenuation *= attenuation;
+				cur_ray = scattered;
+			}
+			else {
+				return vec3(0.0, 0.0, 0.0);
+			}
+		}
+		else {
+			vec3 unit_direction = unit_vector(cur_ray.direction());
+			float t = 0.5f*(unit_direction.y() + 1.0f);
+			vec3 c = (1.0f - t)*vec3(1.0, 1.0, 1.0) + t * vec3(0.5, 0.7, 1.0);
+			return cur_attenuation * c;
+		}
+	}
+	// reached max recursion
+	return vec3(0.0, 0.0, 0.0);
+
+}
+
+__global__ void rand_init(curandState *rand_state) {
+	if (threadIdx.x == 0 && blockIdx.x == 0) {
+		curand_init(1004, 0, 0, rand_state);
+	}
+}
+
+/* Initialize rand function so that each thread will have guaranteed distinct random numbrs*/
+__global__ void render_init(int max_x, int max_y, int ns, curandState *rand_state) {
+	int i = blockIdx.x;
+	int j = blockIdx.y;
+	int k = threadIdx.x;
+	if ((i >= max_x) || (j >= max_y) || (k >= ns)) return;
+
+	int pixel_index = j * max_x + i;
+	int sample_index = pixel_index * ns + k;
+	curand_init(sample_index, 0, 0, &rand_state[sample_index]);
+}
+
+__global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hitable **world) {
+	int i = blockIdx.x;
+	int j = blockIdx.y;
+	int k = threadIdx.x;
+	if ((i >= max_x) || (j >= max_y) || (k >= ns)) return;
+
+	extern __shared__ vec3 cols[];
+
+	int pixel_index = j * max_x + i;
+	int sample_index = pixel_index * ns + k;
+
+	curandState local_rand_state;
+	curand_init(sample_index, 0, 0, &local_rand_state);
+
+	float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
+	float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
+	ray r = (*cam)->get_ray(u, v, &local_rand_state);
+
+	cols[k] = color(r, world, &local_rand_state);
+
+	__syncthreads();
+
+	if (k == 0) {
+
+		vec3 col = vec3(0, 0, 0);
+		for (int i = 0; i < ns; i++) {
+			col += cols[i];
+		}
+		col /= float(ns);
+		col[0] = sqrt(col[0]);
+		col[1] = sqrt(col[1]);
+		col[2] = sqrt(col[2]);
+		fb[pixel_index] = col;
+	}
+}
+
+#define RND (curand_uniform(&local_rand_state))
+
+__global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state) {
+	if (threadIdx.x == 0 && blockIdx.x == 0) {
+		curandState local_rand_state = *rand_state;
+		d_list[0] = new sphere(vec3(0, -1000.0, -1), 1000,
+			new lambertian(vec3(0.5, 0.5, 0.5)));
+		int i = 1;
+		for (int a = -11; a < 11; a++) {
+			for (int b = -11; b < 11; b++) {
+				float choose_mat = RND;
+				vec3 center(a + RND, 0.2, b + RND);
+				if (choose_mat < 0.8f) {
+					d_list[i++] = new sphere(center, 0.2,
+						new lambertian(vec3(RND*RND, RND*RND, RND*RND)));
+				}
+				else if (choose_mat < 0.95f) {
+					d_list[i++] = new sphere(center, 0.2,
+						new metal(vec3(0.5f*(1.0f + RND), 0.5f*(1.0f + RND), 0.5f*(1.0f + RND)), 0.5f*RND));
+				}
+				else {
+					d_list[i++] = new sphere(center, 0.2, new dielectric(1.5));
+				}
+			}
+		}
+		d_list[i++] = new sphere(vec3(0, 1, 0), 1.0, new dielectric(1.5));
+		d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
+		d_list[i++] = new sphere(vec3(4, 1, 0), 1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
+		*rand_state = local_rand_state;
+		*d_world = new hitable_list(d_list, 22 * 22 + 1 + 3);
+
+		vec3 lookfrom(13, 2, 3);
+		vec3 lookat(0, 0, 0);
+		float dist_to_focus = 10.0; (lookfrom - lookat).length();
+		float aperture = 0.1;
+		*d_camera = new camera(lookfrom,
+			lookat,
+			vec3(0, 1, 0),
+			30.0,
+			float(nx) / float(ny),
+			aperture,
+			dist_to_focus);
+	}
+}
+
+__global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera) {
+	for (int i = 0; i < 22 * 22 + 1 + 3; i++) {
+		delete ((sphere *)d_list[i])->mat_ptr;
+		delete d_list[i];
+	}
+	delete *d_world;
+	delete *d_camera;
+}
+
+void createGLTextureForCUDA(GLuint* gl_tex, cudaGraphicsResource** cuda_tex, unsigned int size_x, unsigned int size_y) {
+
+	// Create an OpenGL texture
+	glGenTextures(1, gl_tex);	//generate 1 texture
+	glBindTexture(GL_TEXTURE_2D, *gl_tex);	// set it as current target
+
+	// Set basic texture parameters
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+	// Specify 2D texture
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI_EXT, size_x, size_y, 0, GL_RGB_INTEGER_EXT, GL_UNSIGNED_BYTE, NULL);
 	
+	// Register this texture with CUDA
+	checkCudaErrors(cudaGraphicsGLRegisterImage(cuda_tex, *gl_tex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard));
+}
+
+bool initGLFW() {
+
 	// Initialize GLFW
 	if (glfwInit() == GL_FALSE) {
-		return -1;
-	}
-
-	// Create Window
-	GLFWwindow* window = glfwCreateWindow(640, 480, "OpenGL Simple", NULL, NULL);
-	if (!window) {
-		glfwTerminate();
-		return -1;
+		exit(EXIT_FAILURE);
 	}
 
 	// Version Setting
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
-	
+
+	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+
+
+
+	// Create Window
+	window = glfwCreateWindow(WIDTH, HEIGHT, "Raytracer", NULL, NULL);
+	if (!window) {
+		glfwTerminate();
+		exit(EXIT_FAILURE);
+	}
+
 	// Create Context
 	glfwMakeContextCurrent(window);
 	glfwSwapInterval(1);
 
-	// Initialize GLEW
-	if (glewInit() != GLEW_OK) {
-		return -1;
+	// Do keyboard stuff here
+
+	return true;
+}
+
+void initGLBuffers() {
+	// Create texture that will receive the result of cuda rendering
+	createGLTextureForCUDA(&opengl_tex_cuda, &cuda_tex_resource, WIDTH, HEIGHT);
+	
+	// Create shader program
+	drawtex_v = GLSLShader("Textured draw vertex shader", glsl_drawtex_vertshader_src, GL_VERTEX_SHADER);
+	drawtex_f = GLSLShader("Textured draw fragment shader", glsl_drawtex_fragshader_src, GL_FRAGMENT_SHADER);
+	shdrawtex = GLSLProgram(&drawtex_v, &drawtex_f);
+	shdrawtex.compile();
+}
+
+bool initGL() {
+	glewExperimental = GL_TRUE;	// need this for core profile
+	GLenum err = glewInit();
+	glGetError();
+	if (err != GLEW_OK) {
+		printf("glewInit failed : %s /n", glewGetErrorString(err));
+		exit(EXIT_FAILURE);
 	}
+	glViewport(0, 0, WIDTH, HEIGHT);
+
+	return true;
+}
+
+void initCUDABuffers() {
+	cudaError_t stat;
+
+	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer, size_tex_data));
+	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer_2, size_tex_data));
+	checkCudaErrors(cudaMalloc(&cuda_ping_buffer, size_tex_data));
+
+}
+
+
+void generateCUDAImage(std::chrono::duration<double> totalTime, std::chrono::duration<double> deltaTime) {
+
+	inputPointers pointers{ (unsigned int*)cuda_dev_render_buffer };
+
+	// Render
+
+	// Set image resolutions
+	int image_width = 640;
+	int image_height = 480;
+
+	// samples per pixel
+	int ns = 10;
+
+	// thread block dimension
+	int tx = 32;
+	int ty = 32;
+
+	int num_pixels = image_width * image_height;
+	size_t fb_size = num_pixels * sizeof(vec3);
+
+	vec3 *fb;
+	checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
+
+	curandState *d_rand_state2;
+	checkCudaErrors(cudaMalloc((void**)&d_rand_state2, 1 * sizeof(curandState)));
+
+	rand_init<<<1, 1>>>(d_rand_state2);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
+
+	hitable **d_list;
+	int num_hitables = 22 * 22 + 1 + 3;
+	checkCudaErrors(cudaMalloc((void**)&d_list, num_hitables * sizeof(hitable*)));
+	hitable **d_world;
+	checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hitable_list*)));
+	camera **d_camera;
+	checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
+	create_world << <1, 1 >> > (d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
+
+	clock_t start, stop;
+	start = clock();
+
+	dim3 blocks(image_width, image_height);
+	dim3 threads(ns);
+	// render_init<<<blocks, threads>>>(image_width, image_height, ns, d_rand_state);
+	// checkCudaErrors(cudaGetLastError());
+	// checkCudaErrors(cudaDeviceSynchronize());
+	render << <blocks, threads, ns * sizeof(vec3) >> > (fb, image_width, image_height, ns, d_camera, d_world);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
+
+	stop = clock();
+	double timer_seconds = ((double)(stop - start) / CLOCKS_PER_SEC);
+	std::cout << "Renderd in " << timer_seconds << " [s]." << std::endl;
+
+
+	// pointers.image1[]
+
+
+	// Free memory
+	checkCudaErrors(cudaDeviceSynchronize());
+	free_world << <1, 1 >> > (d_list, d_world, d_camera);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaFree(d_camera));
+	checkCudaErrors(cudaFree(d_list));
+	checkCudaErrors(cudaFree(d_world));
+	checkCudaErrors(cudaFree(d_rand_state2));
+	checkCudaErrors(cudaFree(fb));
+
+	/*----------*/
+
+	cudaArray* texture_ptr;
+	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, 0));
+	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&texture_ptr, cuda_tex_resource, 0, 0));
+
+	checkCudaErrors(cudaMemcpyToArray(texture_ptr, 0, 0, cuda_dev_render_buffer_2, size_tex_data, cudaMemcpyDeviceToDevice));
+	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, 0));
+
+	cudaDeviceSynchronize();
+}
+
+void display(std::chrono::duration<double> duration, std::chrono::duration<double> deltaTime) {
+	glClear(GL_COLOR_BUFFER_BIT);
+	generateCUDAImage(duration, deltaTime);
+	glfwPollEvents();
+	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+	// Swap the screen buffer
+	glfwSwapBuffers(window);
+}
+
+
+int main(int argc, char* argv[]) {
+
+
+	initGLFW();
+	initGL();
+	
+	// Find best cuda device
+	findCudaGLDevice(argc, (const char**)argv);
+	initGLBuffers();
+	initCUDABuffers();
+
+	// Generate buffers
+	glGenVertexArrays(1, &VAO);
+	glGenBuffers(1, &VBO);
+	glGenBuffers(1, &EBO);
+
+	// Buffer setup
+	glBindVertexArray(VAO);
+	glBindBuffer(GL_ARRAY_BUFFER, VBO);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
+
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, VBO);
+	glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
+
+	// Position attribute (3 floats)
+	glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)0);
+	glEnableVertexAttribArray(0);
+
+	glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(GLfloat), (GLvoid*)(3*sizeof(GLfloat)));
+	glEnableVertexAttribArray(1);
+
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+
+
+	glBindVertexArray(VAO);
+	glClearColor(0.2f, 0.3f, 0.3f, 0.1f);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, opengl_tex_cuda);
+
+	shdrawtex.use();
+	glUniform1i(glGetUniformLocation(shdrawtex.program, "tex"), 0);
+
+	auto firstTime = std::chrono::system_clock::now();
+	auto lastTime = firstTime;
+	auto lastMeasureTime = firstTime;
+	int frameNum = 0;
 
 	// Loop fram
 	while (glfwWindowShouldClose(window) == GL_FALSE) {		
 		
-		// Clear buffer
-		glClearColor(0.2f, 0.2f, 0.2f, 0.0f);
-		glClear(GL_COLOR_BUFFER_BIT);
+		auto currTime = std::chrono::system_clock::now();
+		auto totalTime = currTime - firstTime;
 
-		// Swap buffer
-		glfwSwapBuffers(window);
-		glfwPollEvents();
+		display(totalTime, currTime - lastTime);
+		std::chrono::duration<double> elapsed_seconds = currTime - lastMeasureTime;
+		frameNum++;
+
+		// show fps every  second
+		if (elapsed_seconds.count() >= 1.0) {
+
+			std::cout << "fps: " << (frameNum / elapsed_seconds.count()) << "\n";
+			frameNum = 0;
+			lastMeasureTime = currTime;
+		}
+		lastTime = currTime;
 	}
+	glBindVertexArray(0);
 
 	// End GLFW
+	glfwDestroyWindow(window);
 	glfwTerminate();
+
+	cudaDeviceReset();
 
 	return 0;
 }
-
-/*
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size);
-
-__global__ void addKernel(int *c, const int *a, const int *b)
-{
-    int i = threadIdx.x;
-    c[i] = a[i] + b[i];
-}
-
-
-int main()
-{
-    const int arraySize = 5;
-    const int a[arraySize] = { 1, 2, 3, 4, 5 };
-    const int b[arraySize] = { 10, 20, 30, 40, 50 };
-    int c[arraySize] = { 0 };
-
-    // Add vectors in parallel.
-    cudaError_t cudaStatus = addWithCuda(c, a, b, arraySize);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addWithCuda failed!");
-        return 1;
-    }
-
-    printf("{1,2,3,4,5} + {10,20,30,40,50} = {%d,%d,%d,%d,%d}\n",
-        c[0], c[1], c[2], c[3], c[4]);
-
-    // cudaDeviceReset must be called before exiting in order for profiling and
-    // tracing tools such as Nsight and Visual Profiler to show complete traces.
-    cudaStatus = cudaDeviceReset();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceReset failed!");
-        return 1;
-    }
-
-    return 0;
-}
-
-// Helper function for using CUDA to add vectors in parallel.
-cudaError_t addWithCuda(int *c, const int *a, const int *b, unsigned int size)
-{
-    int *dev_a = 0;
-    int *dev_b = 0;
-    int *dev_c = 0;
-    cudaError_t cudaStatus;
-
-    // Choose which GPU to run on, change this on a multi-GPU system.
-    cudaStatus = cudaSetDevice(0);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaSetDevice failed!  Do you have a CUDA-capable GPU installed?");
-        goto Error;
-    }
-
-    // Allocate GPU buffers for three vectors (two input, one output)    .
-    cudaStatus = cudaMalloc((void**)&dev_c, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_a, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMalloc((void**)&dev_b, size * sizeof(int));
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMalloc failed!");
-        goto Error;
-    }
-
-    // Copy input vectors from host memory to GPU buffers.
-    cudaStatus = cudaMemcpy(dev_a, a, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    cudaStatus = cudaMemcpy(dev_b, b, size * sizeof(int), cudaMemcpyHostToDevice);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-    // Launch a kernel on the GPU with one thread for each element.
-    addKernel<<<1, size>>>(dev_c, dev_a, dev_b);
-
-    // Check for any errors launching the kernel
-    cudaStatus = cudaGetLastError();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "addKernel launch failed: %s\n", cudaGetErrorString(cudaStatus));
-        goto Error;
-    }
-    
-    // cudaDeviceSynchronize waits for the kernel to finish, and returns
-    // any errors encountered during the launch.
-    cudaStatus = cudaDeviceSynchronize();
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaDeviceSynchronize returned error code %d after launching addKernel!\n", cudaStatus);
-        goto Error;
-    }
-
-    // Copy output vector from GPU buffer to host memory.
-    cudaStatus = cudaMemcpy(c, dev_c, size * sizeof(int), cudaMemcpyDeviceToHost);
-    if (cudaStatus != cudaSuccess) {
-        fprintf(stderr, "cudaMemcpy failed!");
-        goto Error;
-    }
-
-Error:
-    cudaFree(dev_c);
-    cudaFree(dev_a);
-    cudaFree(dev_b);
-    
-    return cudaStatus;
-}
-*/
