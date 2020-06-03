@@ -35,8 +35,8 @@
 #define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__)
 
 GLFWwindow* window;
-int WIDTH = 640;
-int HEIGHT = 480;
+int WIDTH = 480;
+int HEIGHT = 360;
 int num_texels = WIDTH * HEIGHT;
 int num_values = num_texels * 4;
 int size_tex_data = sizeof(GLuint) * num_values;
@@ -111,9 +111,12 @@ void check_cuda(cudaError_t result, char const *const func, const char *const fi
 
 
 __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_state) {
+	
 	ray cur_ray = r;
 	vec3 cur_attenuation = vec3(1.0, 1.0, 1.0);
-	for (int i = 0; i < 4; i++) {
+
+	
+	for (int i = 0; i < 8; i++) {
 		hit_record rec;
 		if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
 			ray scattered;
@@ -145,51 +148,38 @@ __global__ void rand_init(curandState *rand_state) {
 }
 
 /* Initialize rand function so that each thread will have guaranteed distinct random numbrs*/
-__global__ void render_init(int max_x, int max_y, int ns, curandState *rand_state) {
-	int i = blockIdx.x;
-	int j = blockIdx.y;
-	int k = threadIdx.x;
-	if ((i >= max_x) || (j >= max_y) || (k >= ns)) return;
-
+__global__ void render_init(int max_x, int max_y, curandState *rand_state) {
+	int i = threadIdx.x + blockIdx.x * blockDim.x;
+	int j = threadIdx.y + blockIdx.y * blockDim.y;
+	if ((i >= max_x) || (j >= max_y)) return;
 	int pixel_index = j * max_x + i;
-	int sample_index = pixel_index * ns + k;
-	curand_init(sample_index, 0, 0, &rand_state[sample_index]);
+	//Each thread gets same seed, a different sequence number, no offset
+	curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
 }
 
-__global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hitable **world) {
-	int i = blockIdx.x;
-	int j = blockIdx.y;
-	int k = threadIdx.x;
-	if ((i >= max_x) || (j >= max_y) || (k >= ns)) return;
-
-	extern __shared__ vec3 cols[];
+__global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hitable **world, curandState *rand_state, inputPointers pointers) {
+	
+	int i = threadIdx.x + blockIdx.x * blockDim.x;
+	int j = threadIdx.y + blockIdx.y * blockDim.y;
+	if ((i >= max_x) || (j >= max_y)) return;
 
 	int pixel_index = j * max_x + i;
-	int sample_index = pixel_index * ns + k;
-
-	curandState local_rand_state;
-	curand_init(sample_index, 0, 0, &local_rand_state);
-
-	float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
-	float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
-	ray r = (*cam)->get_ray(u, v, &local_rand_state);
-
-	cols[k] = color(r, world, &local_rand_state);
-
-	__syncthreads();
-
-	if (k == 0) {
-
-		vec3 col = vec3(0, 0, 0);
-		for (int i = 0; i < ns; i++) {
-			col += cols[i];
-		}
-		col /= float(ns);
-		col[0] = sqrt(col[0]);
-		col[1] = sqrt(col[1]);
-		col[2] = sqrt(col[2]);
-		fb[pixel_index] = col;
+	curandState local_rand_state = rand_state[pixel_index];
+	vec3 col(0, 0, 0);
+	for (int s = 0; s < ns; s++) {
+		float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
+		float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
+		ray r = (*cam)->get_ray(u, v, &local_rand_state);
+		col += color(r, world, &local_rand_state);
 	}
+	rand_state[pixel_index] = local_rand_state;
+
+	int firstPos = (max_x * j + i) * 4;
+	col /= float(ns);
+	pointers.image1[firstPos] = sqrt(col[0])*255;
+	pointers.image1[firstPos+1] = sqrt(col[1])*255;
+	pointers.image1[firstPos+2] = sqrt(col[2])*255;
+		
 }
 
 #define RND (curand_uniform(&local_rand_state))
@@ -200,6 +190,7 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
 		d_list[0] = new sphere(vec3(0, -1000.0, -1), 1000,
 			new lambertian(vec3(0.5, 0.5, 0.5)));
 		int i = 1;
+		/*
 		for (int a = -11; a < 11; a++) {
 			for (int b = -11; b < 11; b++) {
 				float choose_mat = RND;
@@ -216,12 +207,12 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
 					d_list[i++] = new sphere(center, 0.2, new dielectric(1.5));
 				}
 			}
-		}
+		}*/
 		d_list[i++] = new sphere(vec3(0, 1, 0), 1.0, new dielectric(1.5));
 		d_list[i++] = new sphere(vec3(-4, 1, 0), 1.0, new lambertian(vec3(0.4, 0.2, 0.1)));
 		d_list[i++] = new sphere(vec3(4, 1, 0), 1.0, new metal(vec3(0.7, 0.6, 0.5), 0.0));
 		*rand_state = local_rand_state;
-		*d_world = new hitable_list(d_list, 22 * 22 + 1 + 3);
+		*d_world = new hitable_list(d_list, 1 + 3);
 
 		vec3 lookfrom(13, 2, 3);
 		vec3 lookat(0, 0, 0);
@@ -238,7 +229,7 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
 }
 
 __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camera) {
-	for (int i = 0; i < 22 * 22 + 1 + 3; i++) {
+	for (int i = 0; i < 1+3; i++) {
 		delete ((sphere *)d_list[i])->mat_ptr;
 		delete d_list[i];
 	}
@@ -328,32 +319,29 @@ void initCUDABuffers() {
 	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer_2, size_tex_data));
 	checkCudaErrors(cudaMalloc(&cuda_ping_buffer, size_tex_data));
 
+	cudaDeviceSynchronize();
 }
 
 
 void generateCUDAImage(std::chrono::duration<double> totalTime, std::chrono::duration<double> deltaTime) {
 
-	inputPointers pointers{ (unsigned int*)cuda_dev_render_buffer };
-
-	// Render
-
-	// Set image resolutions
-	int image_width = 640;
-	int image_height = 480;
-
 	// samples per pixel
-	int ns = 10;
+	int ns = 1;
 
 	// thread block dimension
 	int tx = 32;
 	int ty = 32;
 
-	int num_pixels = image_width * image_height;
+	int num_pixels = WIDTH * HEIGHT;
 	size_t fb_size = num_pixels * sizeof(vec3);
+
+	inputPointers pointers{ (unsigned int*)cuda_dev_render_buffer };
 
 	vec3 *fb;
 	checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
 
+	curandState *d_rand_state;
+	checkCudaErrors(cudaMalloc((void**)&d_rand_state, num_pixels * sizeof(curandState)));
 	curandState *d_rand_state2;
 	checkCudaErrors(cudaMalloc((void**)&d_rand_state2, 1 * sizeof(curandState)));
 
@@ -362,25 +350,25 @@ void generateCUDAImage(std::chrono::duration<double> totalTime, std::chrono::dur
 	checkCudaErrors(cudaDeviceSynchronize());
 
 	hitable **d_list;
-	int num_hitables = 22 * 22 + 1 + 3;
+	int num_hitables = 1 + 3;
 	checkCudaErrors(cudaMalloc((void**)&d_list, num_hitables * sizeof(hitable*)));
 	hitable **d_world;
 	checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hitable_list*)));
 	camera **d_camera;
 	checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
-	create_world << <1, 1 >> > (d_list, d_world, d_camera, image_width, image_height, d_rand_state2);
+	create_world << <1, 1 >> > (d_list, d_world, d_camera, WIDTH, HEIGHT, d_rand_state2);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 
 	clock_t start, stop;
 	start = clock();
 
-	dim3 blocks(image_width, image_height);
+	dim3 blocks(WIDTH, HEIGHT);
 	dim3 threads(ns);
-	// render_init<<<blocks, threads>>>(image_width, image_height, ns, d_rand_state);
-	// checkCudaErrors(cudaGetLastError());
-	// checkCudaErrors(cudaDeviceSynchronize());
-	render << <blocks, threads, ns * sizeof(vec3) >> > (fb, image_width, image_height, ns, d_camera, d_world);
+	render_init<<<blocks, threads>>>(WIDTH, HEIGHT, d_rand_state);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
+	render << <blocks, threads >> > (fb, WIDTH, HEIGHT, ns, d_camera, d_world, d_rand_state, pointers);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 
@@ -389,7 +377,6 @@ void generateCUDAImage(std::chrono::duration<double> totalTime, std::chrono::dur
 	std::cout << "Renderd in " << timer_seconds << " [s]." << std::endl;
 
 
-	// pointers.image1[]
 
 
 	// Free memory
@@ -408,7 +395,7 @@ void generateCUDAImage(std::chrono::duration<double> totalTime, std::chrono::dur
 	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, 0));
 	checkCudaErrors(cudaGraphicsSubResourceGetMappedArray(&texture_ptr, cuda_tex_resource, 0, 0));
 
-	checkCudaErrors(cudaMemcpyToArray(texture_ptr, 0, 0, cuda_dev_render_buffer_2, size_tex_data, cudaMemcpyDeviceToDevice));
+	checkCudaErrors(cudaMemcpyToArray(texture_ptr, 0, 0, cuda_dev_render_buffer, size_tex_data, cudaMemcpyDeviceToDevice));
 	checkCudaErrors(cudaGraphicsUnmapResources(1, &cuda_tex_resource, 0));
 
 	cudaDeviceSynchronize();
@@ -446,7 +433,7 @@ int main(int argc, char* argv[]) {
 	glBindBuffer(GL_ARRAY_BUFFER, VBO);
 	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), vertices, GL_STATIC_DRAW);
 
-	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, VBO);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, EBO);
 	glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(indices), indices, GL_STATIC_DRAW);
 
 	// Position attribute (3 floats)
@@ -461,7 +448,7 @@ int main(int argc, char* argv[]) {
 
 
 	glBindVertexArray(VAO);
-	glClearColor(0.2f, 0.3f, 0.3f, 0.1f);
+	glClearColor(0.0f, 0.0f, 0.3f, 0.1f);
 	glClear(GL_COLOR_BUFFER_BIT);
 
 	glActiveTexture(GL_TEXTURE0);
@@ -475,9 +462,9 @@ int main(int argc, char* argv[]) {
 	auto lastMeasureTime = firstTime;
 	int frameNum = 0;
 
-	// Loop fram
-	while (glfwWindowShouldClose(window) == GL_FALSE) {		
-		
+	// Loop frame
+	//while (glfwWindowShouldClose(window) == GL_FALSE) {		
+	for (int i = 0; i < 1; i++) {
 		auto currTime = std::chrono::system_clock::now();
 		auto totalTime = currTime - firstTime;
 
@@ -495,6 +482,12 @@ int main(int argc, char* argv[]) {
 		lastTime = currTime;
 	}
 	glBindVertexArray(0);
+
+	do
+	{
+		std::cout << '\n' << "Press a key to continue...";
+	} while (std::cin.get() != '\n');
+
 
 	// End GLFW
 	glfwDestroyWindow(window);
