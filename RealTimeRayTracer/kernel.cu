@@ -116,7 +116,7 @@ __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_sta
 	vec3 cur_attenuation = vec3(1.0, 1.0, 1.0);
 
 	
-	for (int i = 0; i < 8; i++) {
+	for (int i = 0; i < 2; i++) {
 		hit_record rec;
 		if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
 			ray scattered;
@@ -187,12 +187,13 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hit
 __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_camera, int nx, int ny, curandState *rand_state) {
 	if (threadIdx.x == 0 && blockIdx.x == 0) {
 		curandState local_rand_state = *rand_state;
+
 		d_list[0] = new sphere(vec3(0, -1000.0, -1), 1000,
 			new lambertian(vec3(0.5, 0.5, 0.5)));
+		
 		int i = 1;
-		/*
-		for (int a = -11; a < 11; a++) {
-			for (int b = -11; b < 11; b++) {
+		/*for (int a = -2; a < 2; a++) {
+			for (int b = -2; b < 2; b++) {
 				float choose_mat = RND;
 				vec3 center(a + RND, 0.2, b + RND);
 				if (choose_mat < 0.8f) {
@@ -323,73 +324,17 @@ void initCUDABuffers() {
 }
 
 
-void generateCUDAImage(std::chrono::duration<double> totalTime, std::chrono::duration<double> deltaTime) {
-
-	// samples per pixel
-	int ns = 1;
-
-	// thread block dimension
-	int tx = 32;
-	int ty = 32;
-
-	int num_pixels = WIDTH * HEIGHT;
-	size_t fb_size = num_pixels * sizeof(vec3);
-
-	inputPointers pointers{ (unsigned int*)cuda_dev_render_buffer };
-
-	vec3 *fb;
-	checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
-
-	curandState *d_rand_state;
-	checkCudaErrors(cudaMalloc((void**)&d_rand_state, num_pixels * sizeof(curandState)));
-	curandState *d_rand_state2;
-	checkCudaErrors(cudaMalloc((void**)&d_rand_state2, 1 * sizeof(curandState)));
-
-	rand_init<<<1, 1>>>(d_rand_state2);
-	checkCudaErrors(cudaGetLastError());
-	checkCudaErrors(cudaDeviceSynchronize());
-
-	hitable **d_list;
-	int num_hitables = 1 + 3;
-	checkCudaErrors(cudaMalloc((void**)&d_list, num_hitables * sizeof(hitable*)));
-	hitable **d_world;
-	checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hitable_list*)));
-	camera **d_camera;
-	checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
-	create_world << <1, 1 >> > (d_list, d_world, d_camera, WIDTH, HEIGHT, d_rand_state2);
-	checkCudaErrors(cudaGetLastError());
-	checkCudaErrors(cudaDeviceSynchronize());
-
-	clock_t start, stop;
-	start = clock();
+void generateCUDAImage(vec3 *fb, int max_x, int max_y, int ns, 
+					   camera **d_camera, hitable **d_world, curandState *d_rand_state, inputPointers pointers, 
+					   std::chrono::duration<double> totalTime, std::chrono::duration<double> deltaTime) {
 
 	dim3 blocks(WIDTH, HEIGHT);
 	dim3 threads(ns);
-	render_init<<<blocks, threads>>>(WIDTH, HEIGHT, d_rand_state);
-	checkCudaErrors(cudaGetLastError());
-	checkCudaErrors(cudaDeviceSynchronize());
+
 	render << <blocks, threads >> > (fb, WIDTH, HEIGHT, ns, d_camera, d_world, d_rand_state, pointers);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 
-	stop = clock();
-	double timer_seconds = ((double)(stop - start) / CLOCKS_PER_SEC);
-	std::cout << "Renderd in " << timer_seconds << " [s]." << std::endl;
-
-
-
-
-	// Free memory
-	checkCudaErrors(cudaDeviceSynchronize());
-	free_world << <1, 1 >> > (d_list, d_world, d_camera);
-	checkCudaErrors(cudaGetLastError());
-	checkCudaErrors(cudaFree(d_camera));
-	checkCudaErrors(cudaFree(d_list));
-	checkCudaErrors(cudaFree(d_world));
-	checkCudaErrors(cudaFree(d_rand_state2));
-	checkCudaErrors(cudaFree(fb));
-
-	/*----------*/
 
 	cudaArray* texture_ptr;
 	checkCudaErrors(cudaGraphicsMapResources(1, &cuda_tex_resource, 0));
@@ -401,19 +346,10 @@ void generateCUDAImage(std::chrono::duration<double> totalTime, std::chrono::dur
 	cudaDeviceSynchronize();
 }
 
-void display(std::chrono::duration<double> duration, std::chrono::duration<double> deltaTime) {
-	glClear(GL_COLOR_BUFFER_BIT);
-	generateCUDAImage(duration, deltaTime);
-	glfwPollEvents();
-	glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
-
-	// Swap the screen buffer
-	glfwSwapBuffers(window);
-}
-
 
 int main(int argc, char* argv[]) {
-
+	
+	// OpenGL Setting
 
 	initGLFW();
 	initGL();
@@ -457,18 +393,76 @@ int main(int argc, char* argv[]) {
 	shdrawtex.use();
 	glUniform1i(glGetUniformLocation(shdrawtex.program, "tex"), 0);
 
+
+	// Rendering Settings
+
+	// samples per pixel
+	int ns = 1;
+
+	// thread block dimension
+	int tx = 32;
+	int ty = 32;
+
+	int num_pixels = WIDTH * HEIGHT;
+	size_t fb_size = num_pixels * sizeof(vec3);
+
+	inputPointers pointers{ (unsigned int*)cuda_dev_render_buffer };
+
+	vec3 *fb;
+	checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
+
+	curandState *d_rand_state;
+	checkCudaErrors(cudaMalloc((void**)&d_rand_state, num_pixels * sizeof(curandState)));
+	curandState *d_rand_state2;
+	checkCudaErrors(cudaMalloc((void**)&d_rand_state2, 1 * sizeof(curandState)));
+
+	rand_init << <1, 1 >> > (d_rand_state2);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
+
+	hitable **d_list;
+	int num_hitables = 1 + 3;
+	checkCudaErrors(cudaMalloc((void**)&d_list, num_hitables * sizeof(hitable*)));
+	hitable **d_world;
+	checkCudaErrors(cudaMalloc((void**)&d_world, sizeof(hitable_list*)));
+	camera **d_camera;
+	checkCudaErrors(cudaMalloc((void**)&d_camera, sizeof(camera*)));
+	create_world << <1, 1 >> > (d_list, d_world, d_camera, WIDTH, HEIGHT, d_rand_state2);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
+
+	dim3 blocks(WIDTH, HEIGHT);
+	dim3 threads(ns);
+	render_init << <blocks, threads >> > (WIDTH, HEIGHT, d_rand_state);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaDeviceSynchronize());
+
 	auto firstTime = std::chrono::system_clock::now();
 	auto lastTime = firstTime;
 	auto lastMeasureTime = firstTime;
 	int frameNum = 0;
 
+	printf("sphere size %d/n", sizeof(sphere));
+	printf("sphere* size %d/n", sizeof(sphere*));
+
 	// Loop frame
-	//while (glfwWindowShouldClose(window) == GL_FALSE) {		
-	for (int i = 0; i < 1; i++) {
+	while (glfwWindowShouldClose(window) == GL_FALSE) {		
+	//for (int i = 0; i < 1; i++) {
+
+		// Calculate duration
 		auto currTime = std::chrono::system_clock::now();
 		auto totalTime = currTime - firstTime;
+		auto deltaTime = currTime - lastTime;
 
-		display(totalTime, currTime - lastTime);
+		// Reset display and call render function
+		glClear(GL_COLOR_BUFFER_BIT);
+		generateCUDAImage(fb, WIDTH, HEIGHT, ns, d_camera, d_world, d_rand_state, pointers, totalTime, deltaTime);
+		glfwPollEvents();
+		glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
+
+		// Swap the screen buffer
+		glfwSwapBuffers(window);
+
 		std::chrono::duration<double> elapsed_seconds = currTime - lastMeasureTime;
 		frameNum++;
 
@@ -483,10 +477,21 @@ int main(int argc, char* argv[]) {
 	}
 	glBindVertexArray(0);
 
+	/*
 	do
 	{
 		std::cout << '\n' << "Press a key to continue...";
-	} while (std::cin.get() != '\n');
+	} while (std::cin.get() != '\n');*/
+
+	// Free rendering memory
+	checkCudaErrors(cudaDeviceSynchronize());
+	free_world << <1, 1 >> > (d_list, d_world, d_camera);
+	checkCudaErrors(cudaGetLastError());
+	checkCudaErrors(cudaFree(d_camera));
+	checkCudaErrors(cudaFree(d_list));
+	checkCudaErrors(cudaFree(d_world));
+	checkCudaErrors(cudaFree(d_rand_state2));
+	checkCudaErrors(cudaFree(fb));
 
 
 	// End GLFW
