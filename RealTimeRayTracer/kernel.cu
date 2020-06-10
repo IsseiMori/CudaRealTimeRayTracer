@@ -40,6 +40,7 @@ int HEIGHT = 360;
 int num_texels = WIDTH * HEIGHT;
 int num_values = num_texels * 4;
 int size_tex_data = sizeof(GLuint) * num_values;
+int size_tex_data_f = sizeof(GLfloat) * num_values;
 
 // OpenGL
 GLuint VBO, VAO, EBO;
@@ -55,6 +56,7 @@ void* cuda_ping_buffer;	// Stores intermediate effects
 
 struct inputPointers {
 	unsigned int* image1; // texture position
+	float* acc_img;	// accumulated image
 };
 
 
@@ -116,7 +118,7 @@ __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_sta
 	vec3 cur_attenuation = vec3(1.0, 1.0, 1.0);
 
 	
-	for (int i = 0; i < 2; i++) {
+	for (int i = 0; i < 50; i++) {
 		hit_record rec;
 		if ((*world)->hit(cur_ray, 0.001f, FLT_MAX, rec)) {
 			ray scattered;
@@ -157,7 +159,7 @@ __global__ void render_init(int max_x, int max_y, curandState *rand_state) {
 	curand_init(1984, pixel_index, 0, &rand_state[pixel_index]);
 }
 
-__global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hitable **world, curandState *rand_state, inputPointers pointers) {
+__global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hitable **world, curandState *rand_state, inputPointers pointers, int frame) {
 	
 	int i = threadIdx.x + blockIdx.x * blockDim.x;
 	int j = threadIdx.y + blockIdx.y * blockDim.y;
@@ -166,19 +168,33 @@ __global__ void render(vec3 *fb, int max_x, int max_y, int ns, camera **cam, hit
 	int pixel_index = j * max_x + i;
 	curandState local_rand_state = rand_state[pixel_index];
 	vec3 col(0, 0, 0);
-	for (int s = 0; s < ns; s++) {
-		float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
-		float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
-		ray r = (*cam)->get_ray(u, v, &local_rand_state);
-		col += color(r, world, &local_rand_state);
-	}
+
+	float u = float(i + curand_uniform(&local_rand_state)) / float(max_x);
+	float v = float(j + curand_uniform(&local_rand_state)) / float(max_y);
+	ray r = (*cam)->get_ray(u, v, &local_rand_state);
+	col += color(r, world, &local_rand_state);
+
 	rand_state[pixel_index] = local_rand_state;
 
 	int firstPos = (max_x * j + i) * 4;
 	col /= float(ns);
-	pointers.image1[firstPos] = sqrt(col[0])*255;
-	pointers.image1[firstPos+1] = sqrt(col[1])*255;
-	pointers.image1[firstPos+2] = sqrt(col[2])*255;
+	// pointers.image1[firstPos] = sqrt(col[0])*255;
+	// pointers.image1[firstPos+1] = sqrt(col[1])*255;
+	// pointers.image1[firstPos+2] = sqrt(col[2])*255;
+	if (frame == 0) {
+		pointers.acc_img[firstPos] = sqrt(col[0]) * 255;
+		pointers.acc_img[firstPos + 1] = sqrt(col[1]) * 255;
+		pointers.acc_img[firstPos + 2] = sqrt(col[2]) * 255;
+	}
+	else {
+		pointers.acc_img[firstPos + 0] = pointers.acc_img[firstPos + 0] * (float)(frame - 1) / (float)(frame) + sqrt(col[0]) * 255 / (float(frame));
+		pointers.acc_img[firstPos + 1] = pointers.acc_img[firstPos + 1] * (float)(frame - 1) / (float)(frame) + sqrt(col[1]) * 255 / (float(frame));
+		pointers.acc_img[firstPos + 2] = pointers.acc_img[firstPos + 2] * (float)(frame - 1) / (float)(frame) + sqrt(col[2]) * 255 / (float(frame));
+	}
+
+	pointers.image1[firstPos + 0] = (int)(pointers.acc_img[firstPos + 0]);
+	pointers.image1[firstPos + 1] = (int)(pointers.acc_img[firstPos + 1]);
+	pointers.image1[firstPos + 2] = (int)(pointers.acc_img[firstPos + 2]);
 		
 }
 
@@ -317,7 +333,7 @@ void initCUDABuffers() {
 	cudaError_t stat;
 
 	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer, size_tex_data));
-	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer_2, size_tex_data));
+	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer_2, size_tex_data_f));
 	checkCudaErrors(cudaMalloc(&cuda_ping_buffer, size_tex_data));
 
 	cudaDeviceSynchronize();
@@ -326,12 +342,12 @@ void initCUDABuffers() {
 
 void generateCUDAImage(vec3 *fb, int max_x, int max_y, int ns, 
 					   camera **d_camera, hitable **d_world, curandState *d_rand_state, inputPointers pointers, 
-					   std::chrono::duration<double> totalTime, std::chrono::duration<double> deltaTime) {
+					   std::chrono::duration<double> totalTime, std::chrono::duration<double> deltaTime, int frame) {
 
 	dim3 blocks(WIDTH, HEIGHT);
 	dim3 threads(ns);
 
-	render << <blocks, threads >> > (fb, WIDTH, HEIGHT, ns, d_camera, d_world, d_rand_state, pointers);
+	render << <blocks, threads >> > (fb, WIDTH, HEIGHT, ns, d_camera, d_world, d_rand_state, pointers, frame);
 	checkCudaErrors(cudaGetLastError());
 	checkCudaErrors(cudaDeviceSynchronize());
 
@@ -406,7 +422,7 @@ int main(int argc, char* argv[]) {
 	int num_pixels = WIDTH * HEIGHT;
 	size_t fb_size = num_pixels * sizeof(vec3);
 
-	inputPointers pointers{ (unsigned int*)cuda_dev_render_buffer };
+	inputPointers pointers{ (unsigned int*)cuda_dev_render_buffer, (float*)cuda_dev_render_buffer_2 };
 
 	vec3 *fb;
 	checkCudaErrors(cudaMallocManaged((void**)&fb, fb_size));
@@ -440,7 +456,8 @@ int main(int argc, char* argv[]) {
 	auto firstTime = std::chrono::system_clock::now();
 	auto lastTime = firstTime;
 	auto lastMeasureTime = firstTime;
-	int frameNum = 0;
+	int frameNum = 0;	// For FPS count
+	int frame = 1;	// For total frame accumulation
 
 	printf("sphere size %d/n", sizeof(sphere));
 	printf("sphere* size %d/n", sizeof(sphere*));
@@ -456,7 +473,7 @@ int main(int argc, char* argv[]) {
 
 		// Reset display and call render function
 		glClear(GL_COLOR_BUFFER_BIT);
-		generateCUDAImage(fb, WIDTH, HEIGHT, ns, d_camera, d_world, d_rand_state, pointers, totalTime, deltaTime);
+		generateCUDAImage(fb, WIDTH, HEIGHT, ns, d_camera, d_world, d_rand_state, pointers, totalTime, deltaTime, frame);
 		glfwPollEvents();
 		glDrawElements(GL_TRIANGLES, 6, GL_UNSIGNED_INT, 0);
 
@@ -465,11 +482,12 @@ int main(int argc, char* argv[]) {
 
 		std::chrono::duration<double> elapsed_seconds = currTime - lastMeasureTime;
 		frameNum++;
+		frame++;
 
 		// show fps every  second
 		if (elapsed_seconds.count() >= 1.0) {
 
-			std::cout << "fps: " << (frameNum / elapsed_seconds.count()) << "\n";
+			std::cout << "fps: " << (frameNum / elapsed_seconds.count()) << ", total: " << frame << "\n";
 			frameNum = 0;
 			lastMeasureTime = currTime;
 		}
