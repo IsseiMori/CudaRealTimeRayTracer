@@ -31,85 +31,10 @@
 #include "camera.h"
 #include "hitable_list.h"
 #include "material.h"
-
-#define checkCudaErrors(val) check_cuda( (val), #val, __FILE__, __LINE__)
-
-GLFWwindow* window;
-int WIDTH = 480;
-int HEIGHT = 360;
-int num_texels = WIDTH * HEIGHT;
-int num_values = num_texels * 4;
-int size_tex_data = sizeof(GLuint) * num_values;
-int size_tex_data_f = sizeof(GLfloat) * num_values;
-
-// OpenGL
-GLuint VBO, VAO, EBO;
-GLSLShader drawtex_f;
-GLSLShader drawtex_v;
-GLSLProgram shdrawtex;
-
-// CUDA buffers
-void* cuda_dev_render_buffer;	// Stores initial
-void* cuda_dev_render_buffer_2;	// Stores final output
-void* cuda_ping_buffer;	// Stores intermediate effects
-
-
-struct inputPointers {
-	unsigned int* image1; // texture position
-	float* acc_img;	// accumulated image
-};
-
-
-struct cudaGraphicsResource* cuda_tex_resource;
-GLuint opengl_tex_cuda;	// OpenGL Texture for cuda result
-
-static const char* glsl_drawtex_vertshader_src =
-"#version 330 core\n"
-"layout (location = 0) in vec3 position;\n"
-"layout (location = 1) in vec2 texCoord;\n"
-"\n"
-"out vec2 ourTexCoord;\n"
-"\n"
-"void main()\n"
-"{\n"
-"	gl_Position = vec4(position, 1.0f);\n"
-"	ourTexCoord = texCoord;\n"
-"}\n";
-
-static const char* glsl_drawtex_fragshader_src =
-"#version 330 core\n"
-"uniform usampler2D tex;\n"
-"in vec2 ourTexCoord;\n"
-"out vec4 color;\n"
-"void main()\n"
-"{\n"
-"   	vec4 c = texture(tex, ourTexCoord);\n"
-"   	color = c / 255.0;\n"
-"}\n";
-
-// QUAD GEOMETRY
-GLfloat vertices[] = {
-	// Positions             // Texture Coords
-	1.0f, 1.0f, 0.5f,1.0f, 1.0f,  // Top Right
-	1.0f, -1.0f, 0.5f, 1.0f, 0.0f,  // Bottom Right
-	-1.0f, -1.0f, 0.5f, 0.0f, 0.0f,  // Bottom Left
-	-1.0f, 1.0f, 0.5f,  0.0f, 1.0f // Top Left 
-};
-// you can also put positions, colors and coordinates in seperate VBO's
-GLuint indices[] = {
-	0, 1, 3,
-	1, 2, 3
-};
-
-
-void check_cuda(cudaError_t result, char const *const func, const char *const file, int const line) {
-	if (result) {
-		std::cerr << "CUDA error = " << static_cast<unsigned int>(result) << "at " <<
-			file << ":" << line << "'" << func << "/n";
-		cudaDeviceReset();
-		exit(99);
-	}
-}
+#include "aabb.h"
+#include "bvh.h"
+#include "opengl_utils.h"
+#include "global.h"
 
 
 __device__ vec3 color(const ray& r, hitable **world, curandState *local_rand_state) {
@@ -254,90 +179,27 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
 	delete *d_camera;
 }
 
-void createGLTextureForCUDA(GLuint* gl_tex, cudaGraphicsResource** cuda_tex, unsigned int size_x, unsigned int size_y) {
-
-	// Create an OpenGL texture
-	glGenTextures(1, gl_tex);	//generate 1 texture
-	glBindTexture(GL_TEXTURE_2D, *gl_tex);	// set it as current target
-
-	// Set basic texture parameters
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-
-	// Specify 2D texture
-	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32UI_EXT, size_x, size_y, 0, GL_RGB_INTEGER_EXT, GL_UNSIGNED_BYTE, NULL);
+__global__ void create_bvh(hitable** list, int list_size, bvh_info** bvh_info_list, morton_info** morton_info_list) {
+	if (threadIdx.x == 0 && blockIdx.x == 0) {
+		
+		for (int i = 0; i < list_size; ++i) {
+			bvh_info_list[i] = new bvh_info{ i, aabb(), vec3(0.0f, 0.0f, 0.0f) };
+			list[i]->bounding_box(0, 0, bvh_info_list[i]->box);
+			bvh_info_list[i]->centroid = bvh_info_list[i]->box.center();
+		}
 	
-	// Register this texture with CUDA
-	checkCudaErrors(cudaGraphicsGLRegisterImage(cuda_tex, *gl_tex, GL_TEXTURE_2D, cudaGraphicsRegisterFlagsWriteDiscard));
-}
-
-bool initGLFW() {
-
-	// Initialize GLFW
-	if (glfwInit() == GL_FALSE) {
-		exit(EXIT_FAILURE);
 	}
+}
 
-	// Version Setting
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 4);
-	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
+__global__ void free_bvh(hitable** list, int list_size, bvh_info** bvh_info_list, morton_info** morton_info_list) {
+	if (threadIdx.x == 0 && blockIdx.x == 0) {
 
-	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
-	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-
-
-
-	// Create Window
-	window = glfwCreateWindow(WIDTH, HEIGHT, "Raytracer", NULL, NULL);
-	if (!window) {
-		glfwTerminate();
-		exit(EXIT_FAILURE);
+		for (int i = 0; i < list_size; ++i) {
+			delete bvh_info_list[i];
+		}
 	}
-
-	// Create Context
-	glfwMakeContextCurrent(window);
-	glfwSwapInterval(1);
-
-	// Do keyboard stuff here
-
-	return true;
 }
 
-void initGLBuffers() {
-	// Create texture that will receive the result of cuda rendering
-	createGLTextureForCUDA(&opengl_tex_cuda, &cuda_tex_resource, WIDTH, HEIGHT);
-	
-	// Create shader program
-	drawtex_v = GLSLShader("Textured draw vertex shader", glsl_drawtex_vertshader_src, GL_VERTEX_SHADER);
-	drawtex_f = GLSLShader("Textured draw fragment shader", glsl_drawtex_fragshader_src, GL_FRAGMENT_SHADER);
-	shdrawtex = GLSLProgram(&drawtex_v, &drawtex_f);
-	shdrawtex.compile();
-}
-
-bool initGL() {
-	glewExperimental = GL_TRUE;	// need this for core profile
-	GLenum err = glewInit();
-	glGetError();
-	if (err != GLEW_OK) {
-		printf("glewInit failed : %s /n", glewGetErrorString(err));
-		exit(EXIT_FAILURE);
-	}
-	glViewport(0, 0, WIDTH, HEIGHT);
-
-	return true;
-}
-
-void initCUDABuffers() {
-	cudaError_t stat;
-
-	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer, size_tex_data));
-	checkCudaErrors(cudaMalloc(&cuda_dev_render_buffer_2, size_tex_data_f));
-	checkCudaErrors(cudaMalloc(&cuda_ping_buffer, size_tex_data));
-
-	cudaDeviceSynchronize();
-}
 
 
 void generateCUDAImage(vec3 *fb, int max_x, int max_y, int ns, 
@@ -459,9 +321,23 @@ int main(int argc, char* argv[]) {
 	int frameNum = 0;	// For FPS count
 	int frame = 1;	// For total frame accumulation
 
-	printf("sphere size %d/n", sizeof(sphere));
-	printf("sphere* size %d/n", sizeof(sphere*));
+	// Debugging for BVH
 
+	// Malloc temporary arrays because they will be parallelized later on.
+	bvh_info **d_bvh_info_list;
+	checkCudaErrors(cudaMalloc((void**)&d_bvh_info_list, num_hitables * sizeof(bvh_info*)));
+	morton_info** d_morton_info_list;
+	checkCudaErrors(cudaMalloc((void**)&d_morton_info_list, num_hitables * sizeof(morton_info*)));
+	create_bvh << <1, 1 >> > (d_list, num_hitables, d_bvh_info_list, d_morton_info_list);
+
+
+
+	free_bvh << <1, 1 >> > (d_list, num_hitables, d_bvh_info_list, d_morton_info_list);
+	checkCudaErrors(cudaFree(d_bvh_info_list));
+	checkCudaErrors(cudaFree(d_morton_info_list));
+
+
+	/*
 	// Loop frame
 	while (glfwWindowShouldClose(window) == GL_FALSE) {		
 	//for (int i = 0; i < 1; i++) {
@@ -494,12 +370,13 @@ int main(int argc, char* argv[]) {
 		lastTime = currTime;
 	}
 	glBindVertexArray(0);
+	*/
 
-	/*
+	
 	do
 	{
 		std::cout << '\n' << "Press a key to continue...";
-	} while (std::cin.get() != '\n');*/
+	} while (std::cin.get() != '\n');
 
 	// Free rendering memory
 	checkCudaErrors(cudaDeviceSynchronize());

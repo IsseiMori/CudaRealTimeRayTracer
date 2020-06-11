@@ -160,8 +160,11 @@
     <None Include="packages.config" />
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="aabb.h" />
+    <ClInclude Include="bvh.h" />
     <ClInclude Include="camera.h" />
     <ClInclude Include="color.h" />
+    <ClInclude Include="global.h" />
     <ClInclude Include="hitable.h" />
     <ClInclude Include="hitable_list.h" />
     <ClInclude Include="libs\helper_cuda.h" />
@@ -169,6 +172,7 @@
     <ClInclude Include="libs\helper_string.h" />
     <ClInclude Include="libs\revision.h" />
     <ClInclude Include="material.h" />
+    <ClInclude Include="opengl_utils.h" />
     <ClInclude Include="ray.h" />
     <ClInclude Include="shader_tools\GLSLProgram.h" />
     <ClInclude Include="shader_tools\GLSLShader.h" />
