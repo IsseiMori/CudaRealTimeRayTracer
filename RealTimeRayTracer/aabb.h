@@ -47,19 +47,33 @@ public:
 		return 0.5f * _min + 0.5f * _max;
 	}
 
+	__device__ void copy(const aabb box) {
+		_min = box._min;
+		_max = box._max;
+	}
+
+	__device__ vec3 offset(const vec3& p) const {
+		vec3 o = p - _min;
+		if (_max[0] > _min[0]) o[0] /= _max[0] - _min[0];
+		if (_max[1] > _min[1]) o[1] /= _max[1] - _min[1];
+		if (_max[2] > _min[2]) o[2] /= _max[2] - _min[2];
+		return o;
+	}
+
 
 	vec3 _min;
 	vec3 _max;
 };
 
-
 __device__ aabb surrounding_box(aabb box0, aabb box1) {
 	vec3 small(fmin(box0.min().x(), box1.min().x()),
-		fmin(box0.min().y(), box1.min().y()),
-		fmin(box0.min().z(), box1.min().z()));
-	vec3 big(fmin(box0.max().x(), box1.max().x()),
-		fmin(box0.max().y(), box1.max().y()),
-		fmin(box0.max().z(), box1.max().z()));
+			   fmin(box0.min().y(), box1.min().y()),
+			   fmin(box0.min().z(), box1.min().z()));
+
+	vec3 big(fmax(box0.max().x(), box1.max().x()),
+			 fmax(box0.max().y(), box1.max().y()),
+			 fmax(box0.max().z(), box1.max().z()));
+
 	return aabb(small, big);
 }
 

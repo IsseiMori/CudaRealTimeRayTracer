@@ -81,5 +81,11 @@ void check_cuda(cudaError_t result, char const* const func, const char* const fi
 	}
 }
 
+// RADIX SORT
+#define BITS_PER_PASS 6
+#define N_BITS 30
+#define N_PASSES 5	// N_BITS / BITS_PER_PASS
+#define N_BUCKETS 64	// 1 << BITS_PER_PASS
+#define BIT_MASK 63		// N_BUCKETS - 1
 
 #endif

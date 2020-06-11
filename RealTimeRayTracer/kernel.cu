@@ -17,6 +17,10 @@
 #include "device_launch_parameters.h"
 #include <curand_kernel.h>
 
+// CUDA Algorithm
+#include <thrust/sort.h>
+#include <thrust/execution_policy.h>
+
 // CUDA Helper
 #include "libs/helper_cuda.h"
 #include "libs/helper_cuda_gl.h"
@@ -129,7 +133,7 @@ __global__ void create_world(hitable **d_list, hitable **d_world, camera **d_cam
 	if (threadIdx.x == 0 && blockIdx.x == 0) {
 		curandState local_rand_state = *rand_state;
 
-		d_list[0] = new sphere(vec3(0, -1000.0, -1), 1000,
+		d_list[0] = new sphere(vec3(0, 0.0, -5), 1.0,
 			new lambertian(vec3(0.5, 0.5, 0.5)));
 		
 		int i = 1;
@@ -179,15 +183,103 @@ __global__ void free_world(hitable **d_list, hitable **d_world, camera **d_camer
 	delete *d_camera;
 }
 
-__global__ void create_bvh(hitable** list, int list_size, bvh_info** bvh_info_list, morton_info** morton_info_list) {
+__global__ void create_bvh(hitable** list, int list_size, bvh_info** bvh_info_list, morton_info** morton_info_list, float dbg[]) {
 	if (threadIdx.x == 0 && blockIdx.x == 0) {
 		
+		// Create an array of bounding box information
 		for (int i = 0; i < list_size; ++i) {
 			bvh_info_list[i] = new bvh_info{ i, aabb(), vec3(0.0f, 0.0f, 0.0f) };
 			list[i]->bounding_box(0, 0, bvh_info_list[i]->box);
 			bvh_info_list[i]->centroid = bvh_info_list[i]->box.center();
 		}
-	
+
+		// Get the bounds of all objects
+		aabb bounds;
+		for (int i = 0; i < list_size; ++i) {
+			if (i == 0) bounds.copy(bvh_info_list[0]->box);
+			else {
+				bounds = surrounding_box(bounds, bvh_info_list[i]->box);
+			}
+		}
+
+		// Create an array of morton code
+		for (int i = 0; i < list_size; ++i) {
+			int morton_bits = 10;
+			int morton_scale = 1 << morton_bits;
+			morton_info_list[i] = new morton_info{ i, 0 };
+			vec3 centroid_offset = bounds.offset(bvh_info_list[i]->centroid);
+			//morton_info_list[i]->motron_code = encode_morton3(centroid_offset);
+			morton_info_list[i]->morton_code = EncodeMorton3(centroid_offset * morton_scale);
+		}
+
+		// Radix Sort
+
+		// temporary array
+		//morton_info* morton_tmp(new morton_info[list_size]);
+		//// sort parameters 
+		//for (int pass = 0; pass < N_PASSES; ++pass) {
+
+		//	// Position of starting bit
+		//	int low_bit = pass * BITS_PER_PASS;
+
+		//	// Alternate copy destinations
+		//	morton_info* in = (pass & 1) ? morton_tmp : *morton_info_list;
+		//	morton_info* out = (pass & 1) ? *morton_info_list : morton_tmp;
+
+		//	// Count number of zero bits in N_BUCKETS digits for all morton code
+		//	int bucket_count[N_BUCKETS] = { 0 };
+		//	for (int digit = 0; digit < list_size; ++digit) {
+		//		int bucket = (in[digit].motron_code >> low_bit) & BIT_MASK;
+		//		++bucket_count[bucket];
+		//	}
+
+		//	// Compute new positions of each element in the sorted array
+		//	int out_index[N_BUCKETS];
+		//	out_index[0] = 0;
+		//	for (int i = 1; i < N_BUCKETS; ++i)
+		//		out_index[i] = out_index[i - 1] + bucket_count[i - 1];
+
+		//	// Store sorted values into the temporary output array
+		//	for (int digit = 0; digit < list_size; ++digit) {
+		//		int bucket = (in[digit].motron_code >> low_bit) & BIT_MASK;
+		//		out[out_index[bucket]++] = in[digit];
+		//	}
+
+		//	int bucket2 = (in[0].motron_code >> low_bit) & BIT_MASK;
+		//	dbg[pass] = out_index[bucket2]++;
+
+		//}
+
+
+		/*if (N_PASSES & 0) {
+			for (int digit = 0; digit < list_size; ++digit) {
+				*morton_info_list[digit] = morton_tmp[digit];
+			}
+		}*/
+
+		// thrust::sort(thrust::seq, morton_info_list[0], morton_info_list[list_size - 1]);
+
+		
+		// Bubble Sort instead... fk my life...
+		for (int i = 0; i < list_size - 1; ++i) {
+			for (int j = 0; j < list_size - i - 1; j++) {
+				if (morton_info_list[j]->morton_code > morton_info_list[j + 1]->morton_code) {
+					morton_info_list[j]->swap(morton_info_list[j + 1]);
+
+				}
+			}
+		}
+
+
+
+
+		dbg[0] = morton_info_list[0]->morton_code;
+		dbg[1] = morton_info_list[1]->morton_code;
+		dbg[2] = morton_info_list[2]->morton_code;
+		dbg[3] = morton_info_list[3]->morton_code;
+		dbg[4] = 0;
+		dbg[5] = 0;
+
 	}
 }
 
@@ -328,8 +420,20 @@ int main(int argc, char* argv[]) {
 	checkCudaErrors(cudaMalloc((void**)&d_bvh_info_list, num_hitables * sizeof(bvh_info*)));
 	morton_info** d_morton_info_list;
 	checkCudaErrors(cudaMalloc((void**)&d_morton_info_list, num_hitables * sizeof(morton_info*)));
-	create_bvh << <1, 1 >> > (d_list, num_hitables, d_bvh_info_list, d_morton_info_list);
 
+	float* d_dbg;
+	float dbg[6];
+	checkCudaErrors(cudaMalloc((void**)&d_dbg, 6*sizeof(float)));
+
+	create_bvh << <1, 1 >> > (d_list, num_hitables, d_bvh_info_list, d_morton_info_list, d_dbg);
+
+	checkCudaErrors(cudaMemcpy(dbg, d_dbg, 6*sizeof(float), cudaMemcpyDeviceToHost));
+	printf("debug: %f\n", dbg[0]);
+	printf("debug: %f\n", dbg[1]);
+	printf("debug: %f\n", dbg[2]);
+	printf("debug: %f\n", dbg[3]);
+	printf("debug: %f\n", dbg[4]);
+	printf("debug: %f\n", dbg[5]);
 
 
 	free_bvh << <1, 1 >> > (d_list, num_hitables, d_bvh_info_list, d_morton_info_list);
