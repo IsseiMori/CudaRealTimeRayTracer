@@ -28,6 +28,11 @@ struct morton_info {
 	}
 };
 
+struct LBVHTreelet {
+	int start_index, n_primitives;
+	bvh_build_node *node;
+};
+
 // Temporary object used to create bvh tree
 struct bvh_info {
 	size_t hitable_index;	// index to unorded list?
@@ -36,20 +41,34 @@ struct bvh_info {
 };
 
 
-class bvh_node : public hitable {
+class bvh_build_node {
 public:
-	__device__ bvh_node() {}
 	
-	__device__ bvh_node(hitable** list, int list_size, float time0, float time1);
+	void init_leaf(int first, int n, const aabb& b) {
 
-	__device__ virtual bool hit(const ray& r, float t_min, float t_max, hit_record& rec) const;
-	__device__ virtual bool bounding_box(float t0, float t1, aabb& output_box) const;
+	}
 
 public:
-	bvh_node* left;		// Left child
-	bvh_node* right;	// Right child
+	bvh_build_node* left;		// Left child
+	bvh_build_node* right;	// Right child
 	aabb box;			// BB for all children
+	int split_axis, first_prim_offset, n_primitives;
 };
+
+//class bvh_node : public hitable {
+//public:
+//	__device__ bvh_node() {}
+//	
+//	__device__ bvh_node(hitable** list, int list_size, float time0, float time1);
+//
+//	__device__ virtual bool hit(const ray& r, float t_min, float t_max, hit_record& rec) const;
+//	__device__ virtual bool bounding_box(float t0, float t1, aabb& output_box) const;
+//
+//public:
+//	bvh_node* left;		// Left child
+//	bvh_node* right;	// Right child
+//	aabb box;			// BB for all children
+//};
 
 class bvh : public hitable {
 public:

@@ -265,7 +265,6 @@ __global__ void create_bvh(hitable** list, int list_size, bvh_info** bvh_info_li
 			for (int j = 0; j < list_size - i - 1; j++) {
 				if (morton_info_list[j]->morton_code > morton_info_list[j + 1]->morton_code) {
 					morton_info_list[j]->swap(morton_info_list[j + 1]);
-
 				}
 			}
 		}
@@ -273,10 +272,12 @@ __global__ void create_bvh(hitable** list, int list_size, bvh_info** bvh_info_li
 
 
 
-		dbg[0] = morton_info_list[0]->morton_code;
-		dbg[1] = morton_info_list[1]->morton_code;
-		dbg[2] = morton_info_list[2]->morton_code;
-		dbg[3] = morton_info_list[3]->morton_code;
+
+
+		dbg[0] = morton_info_list[0]->hitable_index;
+		dbg[1] = morton_info_list[1]->hitable_index;
+		dbg[2] = morton_info_list[2]->hitable_index;
+		dbg[3] = morton_info_list[3]->hitable_index;
 		dbg[4] = 0;
 		dbg[5] = 0;
 
