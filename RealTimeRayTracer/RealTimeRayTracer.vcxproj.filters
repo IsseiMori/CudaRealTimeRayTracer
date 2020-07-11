@@ -1,0 +1,87 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CudaCompile Include="kernel.cu" />
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="Header Files">
+      <UniqueIdentifier>{47ee6def-2ef8-4b88-a761-f9c2abd0ffc8}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="libs">
+      <UniqueIdentifier>{c1b51e6f-925a-4aa1-a803-2c48689dc2a0}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="shader_tools">
+      <UniqueIdentifier>{03ae4afb-82de-4839-ac65-9d7859c70cf9}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="camera.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="color.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="hitable.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="hitable_list.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="material.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ray.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="sphere.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="vec3.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="libs\helper_cuda.h">
+      <Filter>libs</Filter>
+    </ClInclude>
+    <ClInclude Include="libs\helper_cuda_gl.h">
+      <Filter>libs</Filter>
+    </ClInclude>
+    <ClInclude Include="libs\helper_string.h">
+      <Filter>libs</Filter>
+    </ClInclude>
+    <ClInclude Include="libs\revision.h">
+      <Filter>libs</Filter>
+    </ClInclude>
+    <ClInclude Include="shader_tools\GLSLShader.h">
+      <Filter>shader_tools</Filter>
+    </ClInclude>
+    <ClInclude Include="shader_tools\shader_tools_common.h">
+      <Filter>shader_tools</Filter>
+    </ClInclude>
+    <ClInclude Include="shader_tools\GLSLProgram.h">
+      <Filter>shader_tools</Filter>
+    </ClInclude>
+    <ClInclude Include="aabb.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="bvh.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="opengl_utils.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="global.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="packages.config" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="shader_tools\GLSLProgram.cpp">
+      <Filter>shader_tools</Filter>
+    </ClCompile>
+    <ClCompile Include="shader_tools\GLSLShader.cpp">
+      <Filter>shader_tools</Filter>
+    </ClCompile>
+  </ItemGroup>
+</Project>
